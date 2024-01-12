@@ -1,0 +1,107 @@
+---
+- hosts: all
+  become: true
+  vars:
+    no_rvm: no
+    myuser: vagrant
+    mygroup: vagrant
+    homedir: /home/vagrant
+    ruby_version: '2.0.0-p598'
+    ruby_versions:
+      - '2.0.0-p598'
+      - '2.3.0'
+#      - 'rbx-3.19'
+#      - 'jruby-9.0.5.0'
+    rvm_install_path: '/usr/local/rvm'
+    foopwd: "$6$mhOzf/yapZwS$3RwDl4GfWZ5VcfcsHrK9xNNTxyzLOJBsmMttDNaegIbXxMahV86.v/5HsNtit16MEl0EFf5CSW8Dz2yXV.8GB0"
+    foo2pwd: "$6$JiB7y7.M0yI$Abt.ZGIc4DwkRWeI6nKxzzPUZcux7hLRXSdpoKoZvswJz1SZyg5GRQWn9pGID0dgC6e4wFglfW6ev/qZoTqGk/"
+  pre_tasks:
+    - name: get currently installed ruby version
+      command: "{{rvm_install_path}}/rubies/ruby-{{ruby_version}}/bin/ruby -e 'puts \"#{RUBY_VERSION}-p#{RUBY_PATCHLEVEL}\"'"
+      register: current_ruby_version
+      ignore_errors: True
+  roles:
+    - { role: rvm.ruby,
+        tags: ruby,
+        become: yes,
+        rvm1_user: 'root',
+        rvm1_rubies: "{{ ruby_versions }}",
+        rvm1_install_path: "{{rvm_install_path}}",
+        rvm1_install_flags: '--auto-dotfiles', # Make sure RVM sets itself up so the user has access to it
+        rvm1_gpg_key_server: pool.sks-keyservers.net,
+        when: "'{{current_ruby_version.stdout|default()}}' != '{{ruby_version}}' and not no_rvm" }
+  tasks:
+    - group: name="{{mygroup}}" state=present
+    - user: name=net_ssh_1 password="{{foopwd}}" group="{{mygroup}}" state=present
+    - user: name=net_ssh_2 password="{{foo2pwd}}" group="{{mygroup}}" state=present
+    - file: dest=/home/net_ssh_1/.ssh/ state=directory mode=0740 owner=net_ssh_1
+    - file: dest=/home/net_ssh_2/.ssh/ state=directory mode=0740 owner=net_ssh_2
+    - lineinfile: dest=/etc/sudoers.d/net_ssh_1 mode=0440 state=present create=yes
+        line='net_ssh_1 ALL=(ALL) NOPASSWD:ALL' regexp=net_ssh_1
+    - lineinfile: dest=/etc/sudoers.d/net_ssh_1 mode=0440 state=present create=yes
+        line='net_ssh_2 ALL=(ALL) NOPASSWD:ALL' regexp=net_ssh_2
+    - unarchive:
+        src: https://ftp.spline.de/pub/OpenBSD/OpenSSH/portable/openssh-7.4p1.tar.gz
+        dest: /tmp
+        remote_src: True
+    - name: building and installing openssh 7.4 (used in forward test)
+      command: sh -c "./configure --prefix=/opt/net-ssh-openssh && make && sudo make install"
+      args:
+        chdir: /tmp/openssh-7.4p1/
+    - name: drop installed openssh etc/ in favor of symlink
+      file:
+        state: absent
+        path: /opt/net-ssh-openssh/etc
+    - name: creating symlink between system etc/ssh/ and our etc/
+      file:
+        src: /etc/ssh
+        dest: /opt/net-ssh-openssh/etc
+        state: link
+    - command: ssh-keygen -A
+      args:
+        creates: /etc/ssh/ssh_host_ed25519_key
+      notify: restart sshd
+    - name: sshd debug
+      lineinfile: dest='/etc/ssh/sshd_config' line='LogLevel DEBUG' regexp=LogLevel
+      notify: restart sshd
+    - name: sshd allow interactive
+      lineinfile: dest='/etc/ssh/sshd_config' line='ChallengeResponseAuthentication yes' regexp='^ChallengeResponseAuthentication.+'
+      notify: restart sshd
+    - command: ssh-keygen -f /etc/ssh/users_ca -N ''
+      args:
+        creates: /etc/ssh/users_ca.pub
+      notify: restart sshd
+    - name: sshd cert auth
+      lineinfile: dest='/etc/ssh/sshd_config' line='TrustedUserCAKeys /etc/ssh/users_ca.pub'
+      notify: restart sshd
+    - name: sshd allow forward
+      lineinfile: dest='/etc/ssh/sshd_config' line='AllowTcpForwarding all' regexp=LogLevel
+      notify: restart sshd
+    - name: sshd allow forward
+      lineinfile: dest='/etc/ssh/sshd_config' line='GatewayPorts yes' regexp=LogLevel
+      notify: restart sshd
+    - name: put NET_SSH_RUN_INTEGRATION_TESTS=YES environment
+      lineinfile: dest='/etc/environment' line='NET_SSH_RUN_INTEGRATION_TESTS=YES'
+    - name: change dir in bashrc
+      lineinfile: dest="{{homedir}}/.bashrc" owner="{{myuser}}" mode=0644
+        regexp='^cd ' line='cd /net-ssh'
+    - name: add host aliases
+      lineinfile: dest='/etc/hosts' owner='root' group='root' mode=0644
+        regexp='^127\.0\.0\.1\s+gateway.netssh' line='127.0.0.1  gateway.netssh'
+    - apt:
+        pkg:
+          - pv
+          - libgmp3-dev
+          - git
+        state: present
+        update_cache: yes
+    - copy: content='echo "cd /net-ssh ; rake integration-test"' dest=/etc/update-motd.d/99-net-ssh-tests mode=0755
+    - name: add user to rvm group so they can change gem wrappers
+      user:
+        name: "{{myuser}}"
+        groups: rvm
+        append: yes
+      when: "not no_rvm"
+  handlers:
+    - name: restart sshd
+      service: name=ssh state=restarted
