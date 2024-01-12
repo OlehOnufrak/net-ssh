@@ -236,6 +236,7 @@ module Net; module SSH
     # type that was read.
     def read_key
       type = read_string
+
       return (type ? read_keyblob(type) : nil)
     end
 
